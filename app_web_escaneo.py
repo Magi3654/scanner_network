@@ -16,6 +16,12 @@ class Device:
     def __init__(self, ip, hostname="Desconocido"):
         self.ip = ip
         self.hostname = hostname
+        self.mac = "N/A"
+        self.vendor = "N/A"
+        self.os = "N/A"
+        self.os_class = "N/A" # --- MEJORA: Tipo de dispositivo (router, etc.)
+        self.http_title = "N/A" # --- MEJORA: Título de página web
+        self.ports = []
         self.first_seen = datetime.now()
         self.last_seen = datetime.now()
         self.is_active = True
@@ -34,32 +40,112 @@ def get_local_network():
     except Exception:
         return "192.168.1.0/24", "127.0.0.1"
 
-def scan_network(network_range):
+# --- MEJORA: Función de escaneo optimizada ---
+def scan_network(network_range, scan_type='quick'):
     """Escanea la red usando nmap para dispositivos activos."""
     nm = nmap.PortScanner()
-    devices = []
+    devices_dict = {}
+    
+    if scan_type == 'detailed':
+        # -O: Detección de OS
+        # --top-ports 20: Escanea los 20 puertos más comunes
+        # -PE: ARP discovery
+        # Tiempos de espera más largos porque el escaneo de OS/puertos es lento
+        scan_args = '-O --top-ports 20 -PE --host-timeout 10m --max-retries 1 --min-rate 500 --min-parallelism 32'
+    elif scan_type == 'deep':
+        # -O: Detección de OS
+        # -sV: Detección de Versión de Servicio
+        # --script http-title: Intenta obtener el título de la web
+        # Tiempos aún más lentos, es un escaneo muy intrusivo
+        scan_args = '-O -sV --top-ports 20 -PE --script http-title --host-timeout 15m --max-retries 1 --min-rate 300 --min-parallelism 16'
+    else:
+        # Escaneo rápido (solo ping)
+        scan_args = '-sn -PE --host-timeout 5s --max-retries 1 --min-rate 1000 --min-parallelism 64'
+    
+    is_windows = (os.name == 'nt')
+
     try:
-        # Escaneo ping (-sn) con timeout
-        nm.scan(hosts=network_range, arguments='-sn --host-timeout 60s')
-        for host in nm.all_hosts():
-            if nm[host].state() == 'up':
-                hostname = nm[host].hostname() or "Desconocido"
-                devices.append({'ip': host, 'hostname': hostname})
-    except Exception as e:
-        print(f"Error en el escaneo de nmap: {e}")
-    return devices
+        if is_windows:
+            nm.scan(hosts=network_range, arguments=scan_args)
+        else:
+            nm.scan(hosts=network_range, arguments=scan_args, sudo=True) 
+    
+    except nmap.nmap.PortScannerError as e:
+        if not is_windows and 'sudo' in str(e):
+            add_log(f"Error con sudo. Reintentando sin privilegios: {e}")
+            try:
+                 nm.scan(hosts=network_range, arguments=scan_args)
+            except Exception as e_nosudo:
+                 print(f"Error en el escaneo de nmap (sin sudo): {e_nosudo}")
+                 add_log(f"ERROR en Nmap (sin sudo): {e_nosudo}")
+                 return {}
+        else:
+            print(f"Error en el escaneo de nmap: {e}")
+            add_log(f"ERROR en Nmap: {e}. ¿Está 'nmap' instalado y en el PATH del sistema?")
+            return {}
+    except Exception as e_general:
+         print(f"Error general en el escaneo: {e_general}")
+         add_log(f"ERROR: {e_general}. Asegúrate que Nmap esté instalado y en el PATH.")
+         return {}
+
+    for host in nm.all_hosts():
+        if nm[host].state() == 'up':
+            hostname = nm[host].hostname() or "Desconocido"
+            
+            # --- MEJORA: Obtener MAC y Vendor ---
+            mac = nm[host]['addresses'].get('mac', 'N/A')
+            vendor = "N/A"
+            if mac != 'N/A' and 'vendor' in nm[host] and mac in nm[host]['vendor']:
+                vendor = nm[host]['vendor'][mac]
+
+            # --- MEJORA: Obtener OS ---
+            os_match = nm[host].get('osmatch', [])
+            os_name = os_match[0]['name'] if os_match else 'N/A'
+            
+            # --- MEJORA: Obtener Tipo de Dispositivo (OS Class) ---
+            os_class_list = nm[host].get('osclass', [])
+            os_class = os_class_list[0].get('type', 'N/A') if os_class_list else 'N/A'
+            
+            # --- MEJORA: Obtener Título HTTP (de NSE) ---
+            http_title = nm[host].get('script', {}).get('http-title', 'N/A')
+            if isinstance(http_title, dict): # A veces nmap anida la respuesta
+                http_title = http_title.get('output', 'N/A')
+            http_title = http_title.strip()
+
+
+            # --- MEJORA: Obtener Puertos y Versiones ---
+            ports_list = []
+            if 'tcp' in nm[host]:
+                for port in nm[host]['tcp']:
+                    service = nm[host]['tcp'][port].get('name', 'unknown')
+                    version = nm[host]['tcp'][port].get('version', '')
+                    ports_list.append(f"{port}/{service} ({version})" if version else f"{port}/{service}")
+
+            devices_dict[host] = {
+                'ip': host, 
+                'hostname': hostname,
+                'mac': mac,
+                'vendor': vendor,
+                'os': os_name,
+                'os_class': os_class,
+                'http_title': http_title,
+                'ports': ports_list
+            }
+            
+    return devices_dict
 
 # --- 3. Configuración de Flask ---
 
 app = Flask(__name__)
 
 # Variables globales para el estado de la aplicación
-# En un entorno real, esto se manejaría con una base de datos o un sistema de almacenamiento compartido
 known_devices = {}
 scan_active = False
+scan_in_progress = False 
 scan_thread = None
-network_range = get_local_network()[0] # Inicializar con la red local
+network_range = get_local_network()[0] 
 scan_interval = 10
+scan_type = 'quick' # --- MEJORA: Añadir tipo de escaneo global
 last_scan_time = None
 logs = []
 
@@ -79,12 +165,14 @@ def index():
 @app.route('/start_scan', methods=['POST'])
 def start_scan():
     """Inicia el proceso de escaneo en un hilo separado."""
-    global scan_active, scan_thread, network_range, scan_interval
+    global scan_active, scan_thread, network_range, scan_interval, scan_type
     network_range = request.form.get('network_range', network_range)
+    scan_type = request.form.get('scan_type', 'quick') # --- MEJORA: Obtener tipo de escaneo
+    
     try:
         scan_interval = int(request.form.get('scan_interval', scan_interval))
-        if not (5 <= scan_interval <= 60):
-             return jsonify({'success': False, 'message': 'Intervalo debe estar entre 5 y 60 segundos.'})
+        if not (5 <= scan_interval <= 3600): # Aumentado el límite superior
+             return jsonify({'success': False, 'message': 'Intervalo debe estar entre 5 y 3600 segundos.'})
     except ValueError:
         return jsonify({'success': False, 'message': 'Intervalo debe ser un número entero.'})
 
@@ -92,15 +180,25 @@ def start_scan():
         return jsonify({'success': False, 'message': 'Formato de rango de red inválido. Use CIDR (ej. 192.168.1.0/24).'})
 
     mask = int(network_range.split('/')[-1])
-    if not (12 <= mask <= 32):
+    if not (12 <= mask <= 32): 
         return jsonify({'success': False, 'message': f'Máscara /{mask} no soportada. Use entre /12 y /32.'})
+
+    if scan_type not in ['quick', 'detailed', 'deep']:
+        return jsonify({'success': False, 'message': 'Tipo de escaneo inválido.'})
 
     if not scan_active:
         scan_active = True
         scan_thread = threading.Thread(target=scan_worker)
         scan_thread.daemon = True
         scan_thread.start()
-        add_log("Escaneo iniciado.")
+        
+        if scan_type == 'deep':
+            add_log("Iniciando escaneo PROFUNDO. Esto puede tardar mucho tiempo.")
+        elif scan_type == 'detailed':
+            add_log("Iniciando escaneo DETALLADO. Esto puede tardar varios minutos.")
+        else:
+            add_log("Iniciando escaneo RÁPIDO.")
+            
         return jsonify({'success': True, 'message': 'Escaneo iniciado.'})
     else:
         return jsonify({'success': False, 'message': 'El escaneo ya está activo.'})
@@ -126,6 +224,12 @@ def get_devices():
         devices_list.append({
             'ip': device.ip,
             'hostname': device.hostname,
+            'mac': device.mac,
+            'vendor': device.vendor,
+            'os': device.os,
+            'os_class': device.os_class,
+            'http_title': device.http_title,
+            'ports': device.ports,
             'status': status,
             'last_seen': device.last_seen.strftime('%H:%M:%S'),
             'first_seen': device.first_seen.strftime('%H:%M:%S')
@@ -141,50 +245,104 @@ def get_logs():
 @app.route('/get_status')
 def get_status():
     """API endpoint para obtener el estado del escaneo."""
-    global scan_active, network_range, scan_interval, last_scan_time
+    global scan_active, network_range, scan_interval, last_scan_time, scan_in_progress, scan_type
     net_size = calculate_network_size(network_range)
     return jsonify({
         'scan_active': scan_active,
+        'scan_in_progress': scan_in_progress, 
         'network_range': network_range,
         'scan_interval': scan_interval,
+        'scan_type': scan_type,
         'last_scan_time': last_scan_time.strftime('%H:%M:%S') if last_scan_time else 'Nunca',
         'network_size': f"~{net_size} hosts"
     })
 
 # --- 5. Funciones del Hilo de Escaneo ---
 
+# --- MEJORA: Lógica de worker mejorada ---
 def scan_worker():
     """Bucle principal del hilo de escaneo."""
-    global known_devices, scan_active, network_range, last_scan_time
+    global known_devices, scan_active, network_range, last_scan_time, scan_in_progress, scan_type
+    
     while scan_active:
+        scan_start_time = time.time()
         try:
-            current_devices = scan_network(network_range)
-            current_ips = {device['ip'] for device in current_devices}
+            scan_in_progress = True
+            add_log(f"Iniciando escaneo {scan_type} de {network_range}...")
+            
+            current_devices_dict = scan_network(network_range, scan_type)
+            
             last_scan_time = datetime.now()
+            current_ips = set(current_devices_dict.keys())
+            
+            add_log(f"Nmap detectó {len(current_ips)} hosts. Procesando...")
 
             # Actualizar estado de dispositivos conocidos
             for ip in known_devices:
                 if ip in current_ips:
+                    if not known_devices[ip].is_active:
+                         add_log(f"Dispositivo reconectado: {ip}")
                     known_devices[ip].is_active = True
                     known_devices[ip].last_seen = datetime.now()
+                    
+                    # --- MEJORA: Actualizar datos si no se tenían ---
+                    current_dev_data = current_devices_dict[ip]
+                    if known_devices[ip].mac == 'N/A' and current_dev_data.get('mac', 'N/A') != 'N/A':
+                        known_devices[ip].mac = current_dev_data['mac']
+                        known_devices[ip].vendor = current_dev_data.get('vendor', 'N/A')
+                        add_log(f"MAC/Vendor actualizado para {ip}")
+
+                    if known_devices[ip].os == 'N/A' and current_dev_data.get('os', 'N/A') != 'N/A':
+                        known_devices[ip].os = current_dev_data['os']
+                        add_log(f"OS actualizado para {ip}: {known_devices[ip].os}")
+                        
+                    if known_devices[ip].os_class == 'N/A' and current_dev_data.get('os_class', 'N/A') != 'N/A':
+                        known_devices[ip].os_class = current_dev_data['os_class']
+
+                    if known_devices[ip].http_title == 'N/A' and current_dev_data.get('http_title', 'N/A') != 'N/A':
+                        known_devices[ip].http_title = current_dev_data['http_title']
+
+                    if not known_devices[ip].ports and current_dev_data.get('ports'):
+                        known_devices[ip].ports = current_dev_data['ports']
+
                 else:
+                    if known_devices[ip].is_active:
+                         add_log(f"Dispositivo desconectado: {ip}")
                     known_devices[ip].is_active = False
 
             # Agregar nuevos dispositivos
-            for device in current_devices:
-                if device['ip'] not in known_devices:
-                    known_devices[device['ip']] = Device(device['ip'], device['hostname'])
-                    add_log(f"Nuevo dispositivo detectado: {device['ip']} ({device['hostname']})")
-
-            add_log(f"Escaneo completado. {len(current_ips)} hosts activos detectados.")
+            for ip in current_ips:
+                if ip not in known_devices:
+                    dev_data = current_devices_dict[ip]
+                    new_dev = Device(dev_data['ip'], dev_data['hostname'])
+                    new_dev.mac = dev_data.get('mac', 'N/A')
+                    new_dev.vendor = dev_data.get('vendor', 'N/A')
+                    new_dev.os = dev_data.get('os', 'N/A')
+                    new_dev.os_class = dev_data.get('os_class', 'N/A')
+                    new_dev.http_title = dev_data.get('http_title', 'N/A')
+                    new_dev.ports = dev_data.get('ports', [])
+                    known_devices[ip] = new_dev
+                    add_log(f"Nuevo dispositivo: {ip} ({dev_data['hostname']}) [OS: {new_dev.os}]")
 
         except Exception as e:
             add_log(f"Error en el hilo de escaneo: {e}")
+        finally:
+            scan_in_progress = False
+            scan_duration = time.time() - scan_start_time
+            add_log(f"Escaneo tardó {scan_duration:.2f} seg.")
 
-        time.sleep(scan_interval)
-        # Verificar si se debe detener el bucle
-        if not scan_active:
-            break
+            # Lógica de espera inteligente
+            wait_time = max(1.0, scan_interval - scan_duration)
+            
+            # Bucle de espera "interrumpible"
+            wait_start = time.time()
+            while time.time() - wait_start < wait_time:
+                if not scan_active:
+                    break
+                time.sleep(0.5) 
+
+    add_log("Hilo de escaneo finalizado.")
+
 
 def calculate_network_size(network_range):
     """Calcula el número de hosts posibles en una red CIDR."""
@@ -201,12 +359,14 @@ def calculate_network_size(network_range):
 def add_log(message):
     """Agrega un mensaje a la lista de logs."""
     global logs
-    logs.append({
+    entry = {
         'timestamp': datetime.now().strftime('%H:%M:%S'),
         'message': message
-    })
-    # Mantener solo los últimos 50 logs para no consumir mucha memoria
-    if len(logs) > 50:
+    }
+    print(f"LOG: [{entry['timestamp']}] {entry['message']}") # Imprime también a la consola
+    logs.append(entry)
+    # Mantener solo los últimos 100 logs
+    if len(logs) > 100:
         logs.pop(0)
 
 
@@ -227,17 +387,15 @@ HTML_TEMPLATE = '''
             --success: #2ecc71;
             --success-light: #d5f5e3;
             --warning: #f39c12;
+            --warning-light: #fef9e7;
             --danger: #e74c3c;
             --danger-light: #fadbd8;
-            --light: #ecf0f1;
-            --lighter: #f8f9fa;
-            --dark: #34495e;
-            --darker: #2c3e50;
-            --text: #2c3e50;
-            --text-light: #7f8c8d;
-            --border: #dcdde1;
-            --shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
-            --shadow-hover: 0 8px 15px rgba(0, 0, 0, 0.12);
+            --light-gray: #f8f9fa;
+            --gray-border: #e9ecef;
+            --text-dark: #212529;
+            --text-muted: #6c757d;
+            --shadow-sm: 0 4px 12px rgba(0, 0, 0, 0.05);
+            --shadow: 0 6px 15px rgba(0, 0, 0, 0.08);
             --transition: all 0.3s cubic-bezier(0.25, 0.8, 0.25, 1);
         }
 
@@ -249,86 +407,92 @@ HTML_TEMPLATE = '''
 
         body {
             font-family: 'Inter', 'Segoe UI', 'Helvetica Neue', sans-serif;
-            background: linear-gradient(135deg, #f0f4f8 0%, #d9e2ec 100%);
-            color: var(--text);
+            background: var(--light-gray);
+            color: var(--text-dark);
             line-height: 1.6;
-            padding: 20px;
             min-height: 100vh;
         }
 
         .container {
-            max-width: 1400px;
+            max-width: 1600px;
             margin: 0 auto;
-            background-color: white;
-            border-radius: 16px;
-            box-shadow: var(--shadow);
-            overflow: hidden;
-            display: flex;
-            flex-direction: column;
+            padding: 20px;
         }
 
         header {
-            background: linear-gradient(to right, var(--primary), var(--primary-dark));
-            color: white;
+            background: #ffffff;
+            color: var(--text-dark);
             padding: 30px 40px;
             text-align: center;
-            position: relative;
-            overflow: hidden;
-        }
-
-        header::before {
-            content: "";
-            position: absolute;
-            top: -50%;
-            left: -50%;
-            width: 200%;
-            height: 200%;
-            background: radial-gradient(circle, rgba(255,255,255,0.1) 0%, rgba(255,255,255,0) 70%);
-            transform: rotate(30deg);
+            border-radius: 12px;
+            border: 1px solid var(--gray-border);
+            margin-bottom: 20px;
+            box-shadow: var(--shadow-sm);
         }
 
         header h1 {
-            font-size: 2.5em;
-            font-weight: 400;
-            letter-spacing: 1.2px;
+            font-size: 2.2em;
+            font-weight: 600;
+            letter-spacing: -0.5px;
             margin-bottom: 8px;
-            position: relative;
-            z-index: 2;
         }
 
         header p {
-            font-weight: 300;
+            font-weight: 400;
             opacity: 0.9;
             font-size: 1.1em;
-            position: relative;
-            z-index: 2;
+            color: var(--text-muted);
         }
 
-        .status-bar {
-            background-color: var(--darker);
-            color: white;
-            padding: 18px 40px;
+        .status-grid {
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
             gap: 20px;
-            align-items: center;
+            margin-bottom: 20px;
         }
-
-        .status-item {
+        
+        .status-card {
+            background-color: white;
+            border: 1px solid var(--gray-border);
+            border-radius: 12px;
+            padding: 25px;
             display: flex;
             flex-direction: column;
-            align-items: flex-start;
+            align-items: center;
+            box-shadow: var(--shadow-sm);
+            transition: var(--transition);
         }
 
-        .status-item strong {
+        .status-card:hover {
+            box-shadow: var(--shadow);
+            transform: translateY(-4px);
+        }
+        
+        .status-card strong {
             color: var(--secondary);
             font-size: 0.9em;
-            margin-bottom: 3px;
+            margin-bottom: 8px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            font-weight: 600;
         }
 
         .status-value {
             font-weight: 600;
-            font-size: 1.1em;
+            font-size: 1.5em;
+            color: var(--text-dark);
+        }
+        
+        .status-value-small {
+            font-weight: 600;
+            font-size: 1.3em;
+            color: var(--text-dark);
+        }
+        
+        .status-indicator-wrapper {
+             display: flex; 
+             align-items: center; 
+             gap: 10px;
         }
 
         .status-indicator {
@@ -336,7 +500,6 @@ HTML_TEMPLATE = '''
             height: 14px;
             border-radius: 50%;
             display: inline-block;
-            margin-right: 8px;
             transition: var(--transition);
         }
 
@@ -344,6 +507,12 @@ HTML_TEMPLATE = '''
             background-color: var(--success);
             box-shadow: 0 0 10px var(--success);
             animation: pulse 1.5s infinite;
+        }
+        
+        .status-indicator.scanning {
+            background-color: var(--warning);
+            box-shadow: 0 0 10px var(--warning);
+            animation: pulse-warn 1s infinite;
         }
 
         .status-indicator.inactive {
@@ -355,40 +524,41 @@ HTML_TEMPLATE = '''
             70% { box-shadow: 0 0 0 10px rgba(46, 204, 113, 0); }
             100% { box-shadow: 0 0 0 0 rgba(46, 204, 113, 0); }
         }
+        
+        @keyframes pulse-warn {
+            0% { box-shadow: 0 0 0 0 rgba(243, 156, 18, 0.7); }
+            70% { box-shadow: 0 0 0 10px rgba(243, 156, 18, 0); }
+            100% { box-shadow: 0 0 0 0 rgba(243, 156, 18, 0); }
+        }
 
         .main-content {
             display: grid;
-            grid-template-columns: 1fr 1fr;
+            grid-template-columns: 1fr 3fr;
             gap: 20px;
-            padding: 20px;
         }
 
         .card {
             background-color: white;
+            border: 1px solid var(--gray-border);
             border-radius: 12px;
-            box-shadow: var(--shadow);
-            padding: 25px;
-            transition: var(--transition);
+            box-shadow: var(--shadow-sm);
+            padding: 30px;
             display: flex;
             flex-direction: column;
-        }
-
-        .card:hover {
-             box-shadow: var(--shadow-hover);
         }
 
         .card-header {
             display: flex;
             justify-content: space-between;
             align-items: center;
-            margin-bottom: 20px;
-            padding-bottom: 12px;
-            border-bottom: 1px solid var(--border);
+            margin-bottom: 25px;
+            padding-bottom: 15px;
+            border-bottom: 1px solid var(--gray-border);
         }
 
         .card-title {
             font-size: 1.5em;
-            color: var(--darker);
+            color: var(--text-dark);
             font-weight: 600;
             display: flex;
             align-items: center;
@@ -406,49 +576,54 @@ HTML_TEMPLATE = '''
             display: flex;
             flex-wrap: wrap;
             gap: 20px;
-            align-items: end; /* Alinea items al final del contenedor */
+            align-items: end; 
         }
 
         .form-group {
             display: flex;
             flex-direction: column;
             flex: 1;
-            min-width: 200px; /* Ancho mínimo para mantener proporciones */
+            min-width: 150px; 
         }
 
         label {
             font-weight: 600;
             margin-bottom: 8px;
-            color: var(--dark);
+            color: var(--text-dark);
             font-size: 0.95em;
         }
 
-        input[type="text"], input[type="number"] {
+        input[type="text"], input[type="number"], select {
             padding: 14px 16px;
-            border: 1px solid var(--border);
+            border: 1px solid var(--gray-border);
             border-radius: 8px;
             font-size: 1em;
             transition: var(--transition);
-            background-color: var(--lighter);
+            background-color: var(--light-gray);
+            width: 100%;
         }
 
-        input[type="text"]:focus, input[type="number"]:focus {
+        input[type="text"]:focus, input[type="number"]:focus, select:focus {
             outline: none;
             border-color: var(--secondary);
             box-shadow: 0 0 0 4px rgba(52, 152, 219, 0.2);
             background-color: white;
         }
+        
+        input[type="number"] {
+             width: 100px;
+        }
 
         .controls {
             display: flex;
+            flex-direction: column;
             gap: 12px;
             margin-top: 15px;
-            flex-wrap: wrap;
         }
 
         button {
             padding: 12px 26px;
-            border: none;
+            border: 1px solid transparent;
             border-radius: 8px;
             cursor: pointer;
             font-size: 1em;
@@ -456,35 +631,38 @@ HTML_TEMPLATE = '''
             transition: var(--transition);
             display: flex;
             align-items: center;
+            justify-content: center;
             gap: 10px;
-            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.05);
         }
 
         button:active {
              transform: translateY(2px);
-             box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+             box-shadow: 0 2px 4px rgba(0, 0, 0, 0.05);
         }
 
         button#startBtn {
-            background-color: var(--success);
+            background-color: var(--secondary);
+            border-color: var(--secondary);
             color: white;
+            box-shadow: 0 4px 10px rgba(52, 152, 219, 0.2);
         }
 
         button#startBtn:hover:not(:disabled) {
-            background-color: #27ae60;
-            transform: translateY(-3px);
-            box-shadow: 0 6px 10px rgba(0, 0, 0, 0.15);
+            background-color: #2980b9;
+            border-color: #2980b9;
+            transform: translateY(-2px);
+            box-shadow: 0 6px 12px rgba(52, 152, 219, 0.3);
         }
 
         button#stopBtn {
-            background-color: var(--danger);
-            color: white;
+            background-color: var(--light-gray);
+            color: var(--text-dark);
+            border-color: var(--gray-border);
         }
 
         button#stopBtn:hover:not(:disabled) {
-            background-color: #c0392b;
-            transform: translateY(-3px);
-            box-shadow: 0 6px 10px rgba(0, 0, 0, 0.15);
+            background-color: var(--gray-border);
         }
 
         button:disabled {
@@ -493,42 +671,55 @@ HTML_TEMPLATE = '''
             transform: none !important;
             box-shadow: none;
         }
-
+        
+        .table-container {
+            flex: 1; 
+            overflow-y: auto; 
+            min-height: 400px; 
+            max-height: 80vh;
+        }
+        
         table {
             width: 100%;
             border-collapse: separate;
             border-spacing: 0;
-            margin-top: 10px;
-            flex: 1; /* Hacer que la tabla ocupe el espacio restante */
-            min-height: 0; /* Para que flex funcione correctamente dentro de un contenedor con display grid */
+            white-space: normal;
         }
 
         th {
-            background-color: var(--primary);
-            color: white;
+            background-color: var(--light-gray);
+            color: var(--text-muted);
             font-weight: 600;
             text-align: left;
             padding: 16px 20px;
-            position: sticky; /* Fijar encabezado al desplazar */
+            position: sticky; 
             top: 0;
+            z-index: 1;
+            text-transform: uppercase;
+            font-size: 0.85em;
+            letter-spacing: 0.5px;
+            border-bottom: 2px solid var(--gray-border);
         }
 
         td {
-            padding: 14px 20px;
-            border-bottom: 1px solid var(--border);
+            padding: 16px 20px;
+            border-bottom: 1px solid var(--gray-border);
             transition: background-color 0.2s;
+            vertical-align: middle;
+            font-size: 0.95em;
         }
 
         tr:last-child td {
             border-bottom: none;
         }
 
-        tr:nth-child(even) {
-            background-color: var(--lighter);
-        }
-
         tr:hover {
-            background-color: #e3f2fd;
+            background-color: #fcfcfc;
+        }
+        
+        td small {
+            color: var(--text-muted);
+            font-size: 0.9em;
         }
 
         .status-badge {
@@ -545,25 +736,36 @@ HTML_TEMPLATE = '''
 
         .status-badge.active {
             background-color: var(--success-light);
-            color: var(--success);
+            color: #1a6a42;
         }
 
         .status-badge.inactive {
             background-color: var(--danger-light);
-            color: var(--danger);
+            color: #a73c3c;
+        }
+
+        .port-badge {
+            background-color: var(--gray-border);
+            color: var(--text-muted);
+            padding: 3px 8px;
+            border-radius: 6px;
+            font-size: 0.9em;
+            margin: 2px;
+            display: inline-block;
+            font-family: 'JetBrains Mono', monospace;
         }
 
         .logs-container {
-            background-color: #1e1e2e;
-            color: #cdd6f4;
+            background-color: #2c3e50;
+            color: #ecf0f1;
             border-radius: 8px;
             padding: 20px;
-            height: 300px; /* Altura fija para el panel de logs */
+            height: 300px; 
             overflow-y: auto;
             font-family: 'JetBrains Mono', 'Fira Code', 'Consolas', monospace;
             font-size: 0.9em;
             white-space: pre-wrap;
-            flex: 1; /* Hacer que el contenedor de logs ocupe el espacio restante */
+            flex: 1;
             min-height: 0;
         }
 
@@ -574,18 +776,18 @@ HTML_TEMPLATE = '''
         }
 
         .log-timestamp {
-            color: #6c7086;
+            color: #7f8c8d;
             margin-right: 15px;
-            flex-shrink: 0; /* No permitir que el timestamp se encoja */
+            flex-shrink: 0; 
         }
 
         .log-message {
-            flex: 1; /* El mensaje ocupa el resto del espacio */
+            flex: 1; 
         }
 
         .log-entry.info { border-left-color: #89b4fa; }
         .log-entry.success { border-left-color: #a6e3a1; }
-        .log-entry.warning { border-left-color: #f9e2af; }
+        .log-entry.warning { border-left-color: #f9e2af; } 
         .log-entry.error { border-left-color: #f38ba8; }
 
         .device-count {
@@ -597,18 +799,15 @@ HTML_TEMPLATE = '''
             font-weight: bold;
         }
 
-        @media (max-width: 992px) {
-            .main-content {
-                grid-template-columns: 1fr; /* Una columna en pantallas medianas */
-            }
-            .status-bar {
-                grid-template-columns: 1fr 1fr; /* Dos columnas en pantallas medianas */
+        @media (max-width: 1200px) {
+             .main-content {
+                grid-template-columns: 1fr;
             }
         }
 
         @media (max-width: 768px) {
-            .status-bar {
-                grid-template-columns: 1fr; /* Una columna en móviles */
+            .status-grid {
+                grid-template-columns: 1fr;
                 text-align: center;
             }
             .form-row {
@@ -618,6 +817,9 @@ HTML_TEMPLATE = '''
             .form-group {
                 min-width: 100%;
             }
+            input[type="number"] {
+                 width: 100%;
+            }
             button {
                 width: 100%;
                 justify-content: center;
@@ -626,7 +828,13 @@ HTML_TEMPLATE = '''
                 padding: 20px;
             }
             header h1 {
-                font-size: 2em;
+                font-size: 1.8em;
+            }
+            .container {
+                padding: 10px;
+            }
+            body {
+                padding: 0;
             }
         }
     </style>
@@ -640,27 +848,32 @@ HTML_TEMPLATE = '''
             <p>Monitoriza dispositivos activos en tu red</p>
         </header>
 
-        <div class="status-bar">
-            <div class="status-item">
+        <div class="status-grid">
+            <div class="status-card">
                 <strong>Red Actual</strong>
                 <span class="status-value" id="currentNetwork">-</span>
             </div>
-            <div class="status-item">
-                <strong>Tamaño Estimado</strong>
-                <span class="status-value" id="networkSize">-</span>
+            <div class="status-card">
+                <strong>Tipo de Escaneo</strong>
+                <span class="status-value-small" id="currentScanType">-</span>
             </div>
-            <div class="status-item">
+            <div class="status-card">
                 <strong>Último Escaneo</strong>
-                <span class="status-value" id="lastScanTime">-</span>
+                <span class="status-value-small" id="lastScanTime">-</span>
             </div>
-            <div class="status-item">
+            <div class="status-card">
+                <strong>Tamaño Estimado</strong>
+                <span class="status-value-small" id="networkSize">-</span>
+            </div>
+            <div class="status-card">
                 <strong>Estado del Escaneo</strong>
-                <div style="display: flex; align-items: center;">
+                <div class="status-indicator-wrapper">
                     <span class="status-indicator" id="scanIndicator"></span>
                     <span class="status-value" id="scanStatus">Detenido</span>
                 </div>
             </div>
         </div>
+
 
         <div class="main-content">
             <div class="card">
@@ -668,15 +881,21 @@ HTML_TEMPLATE = '''
                     <h2 class="card-title">⚙️ Configuración</h2>
                 </div>
                 <div class="config-form">
-                    <div class="form-row">
-                        <div class="form-group">
-                            <label for="network_range">Rango de Red (CIDR)</label>
-                            <input type="text" id="network_range" value="{{ network_range }}" placeholder="ej. 192.168.1.0/24">
-                        </div>
-                        <div class="form-group">
-                            <label for="scan_interval">Intervalo (segundos)</label>
-                            <input type="number" id="scan_interval" min="5" max="60" value="{{ scan_interval }}" style="width: 100px;">
-                        </div>
+                    <div class="form-group">
+                        <label for="network_range">Rango de Red (CIDR)</label>
+                        <input type="text" id="network_range" value="{{ network_range }}" placeholder="ej. 192.168.1.0/24">
+                    </div>
+                    <div class="form-group">
+                        <label for="scan_type">Tipo de Escaneo</label>
+                        <select id="scan_type">
+                            <option value="quick" selected>Rápido (Solo Descubrir)</option>
+                            <option value="detailed">Detallado (OS y Puertos)</option>
+                            <option value="deep">Profundo (Versión y Scripts)</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label for="scan_interval">Intervalo (segundos)</label>
+                        <input type="number" id="scan_interval" min="5" max="3600" value="{{ scan_interval }}">
                     </div>
                     <div class="controls">
                         <button id="startBtn" onclick="startScan()">▶️ Iniciar Escaneo</button>
@@ -688,24 +907,30 @@ HTML_TEMPLATE = '''
             <div class="card">
                 <div class="card-header">
                     <h2 class="card-title">
-                        _DEVICES Dispositivos Detectados
+                        🖥️ Dispositivos Detectados
                         <span class="device-count" id="deviceCount">0</span>
                     </h2>
                 </div>
-                <table id="devicesTable">
-                    <thead>
-                        <tr>
-                            <th>IP</th>
-                            <th>Hostname</th>
-                            <th>Estado</th>
-                            <th>Última Vez Visto</th>
-                            <th>Primera Vez Visto</th>
-                        </tr>
-                    </thead>
-                    <tbody id="devicesTableBody">
-                        <!-- Datos cargados por JavaScript -->
-                    </tbody>
-                </table>
+                <div class="table-container">
+                    <table id="devicesTable">
+                        <thead>
+                            <tr>
+                                <th>IP</th>
+                                <th>Hostname / Fabricante</th>
+                                <th>MAC Address</th>
+                                <th>Sistema Operativo</th>
+                                <th>Tipo / Título Web</th>
+                                <th>Puertos Abiertos</th>
+                                <th>Estado</th>
+                                <th>Última Vez Visto</th>
+                                <th>Primera Vez Visto</th>
+                            </tr>
+                        </thead>
+                        <tbody id="devicesTableBody">
+                            <!-- Datos cargados por JavaScript -->
+                        </tbody>
+                    </table>
+                </div>
             </div>
 
             <div class="card" style="grid-column: 1 / -1;"> <!-- Ocupa las dos columnas -->
@@ -721,7 +946,7 @@ HTML_TEMPLATE = '''
 
     <script>
         let scanActive = {{ 'true' if scan_active else 'false' }};
-        let refreshIntervalId;
+        let dataRefreshIntervalId;
 
         function updateStatus() {
             fetch('/get_status')
@@ -730,6 +955,9 @@ HTML_TEMPLATE = '''
                     document.getElementById('currentNetwork').textContent = data.network_range;
                     document.getElementById('networkSize').textContent = data.network_size;
                     document.getElementById('lastScanTime').textContent = data.last_scan_time;
+                    
+                    const type_map = {'quick': 'Rápido', 'detailed': 'Detallado', 'deep': 'Profundo'};
+                    document.getElementById('currentScanType').textContent = type_map[data.scan_type] || data.scan_type;
 
                     const indicator = document.getElementById('scanIndicator');
                     const statusText = document.getElementById('scanStatus');
@@ -737,8 +965,13 @@ HTML_TEMPLATE = '''
                     const stopBtn = document.getElementById('stopBtn');
 
                     if (data.scan_active) {
-                        indicator.className = 'status-indicator active';
-                        statusText.textContent = 'Activo';
+                        if (data.scan_in_progress) {
+                            indicator.className = 'status-indicator scanning';
+                            statusText.textContent = 'Escaneando...';
+                        } else {
+                            indicator.className = 'status-indicator active';
+                            statusText.textContent = 'Activo';
+                        }
                         startBtn.disabled = true;
                         stopBtn.disabled = false;
                     } else {
@@ -747,39 +980,62 @@ HTML_TEMPLATE = '''
                         startBtn.disabled = false;
                         stopBtn.disabled = true;
                     }
-                    scanActive = data.scan_active;
+                    scanActive = data.scan_active; 
                 })
                 .catch(error => console.error('Error al obtener estado:', error));
         }
 
         function updateDevices() {
-            if (scanActive) { // Solo actualizar si está activo
-                fetch('/get_devices')
-                    .then(response => response.json())
-                    .then(data => {
-                        const tbody = document.getElementById('devicesTableBody');
-                        tbody.innerHTML = ''; // Limpiar tabla
-                        let activeCount = 0;
-                        data.forEach(device => {
-                            if(device.status === 'ACTIVO') activeCount++;
-                            const row = tbody.insertRow();
-                            row.insertCell(0).textContent = device.ip;
-                            row.insertCell(1).textContent = device.hostname;
+            if (!scanActive) return; 
 
-                            const statusCell = row.insertCell(2);
-                            const badge = document.createElement('span');
-                            badge.className = `status-badge ${device.status.toLowerCase()}`;
-                            badge.textContent = device.status;
-                            statusCell.appendChild(badge);
+            fetch('/get_devices')
+                .then(response => response.json())
+                .then(data => {
+                    const tbody = document.getElementById('devicesTableBody');
+                    tbody.innerHTML = ''; // Limpiar tabla
+                    let activeCount = 0;
+                    data.forEach(device => {
+                        if(device.status === 'ACTIVO') activeCount++;
+                        const row = tbody.insertRow();
+                        
+                        let cellIndex = 0;
+                        row.insertCell(cellIndex++).textContent = device.ip;
 
-                            row.insertCell(3).textContent = device.last_seen;
-                            row.insertCell(4).textContent = device.first_seen;
-                        });
-                        // Actualizar contador de dispositivos activos
-                        document.getElementById('deviceCount').textContent = `${activeCount} / ${data.length}`;
-                    })
-                    .catch(error => console.error('Error al obtener dispositivos:', error));
-            }
+                        // Celda de Hostname y Vendor
+                        const hostCell = row.insertCell(cellIndex++);
+                        hostCell.innerHTML = `<strong>${device.hostname}</strong><br><small>${device.vendor || 'N/A'}</small>`;
+
+                        // Celda de MAC
+                        row.insertCell(cellIndex++).textContent = device.mac || 'N/A';
+                        
+                        // Celda de OS
+                        row.insertCell(cellIndex++).textContent = device.os || 'N/A';
+
+                        // Celda de Tipo / Título
+                        const detailsCell = row.insertCell(cellIndex++);
+                        detailsCell.innerHTML = `<strong>${device.os_class || 'N/A'}</strong><br><small>${device.http_title || ''}</small>`;
+                        
+                        // Celda de Puertos
+                        const portsCell = row.insertCell(cellIndex++);
+                        if(device.ports && device.ports.length > 0) {
+                            portsCell.innerHTML = device.ports.map(p => `<span class="port-badge">${p}</span>`).join(' ');
+                        } else {
+                            portsCell.textContent = 'N/A';
+                        }
+
+                        // Celda de Status
+                        const statusCell = row.insertCell(cellIndex++);
+                        const badge = document.createElement('span');
+                        badge.className = `status-badge ${device.status.toLowerCase()}`;
+                        badge.textContent = device.status;
+                        statusCell.appendChild(badge);
+
+                        row.insertCell(cellIndex++).textContent = device.last_seen;
+                        row.insertCell(cellIndex++).textContent = device.first_seen;
+                    });
+                    document.getElementById('deviceCount').textContent = `${activeCount} / ${data.length}`;
+                })
+                .catch(error => console.error('Error al obtener dispositivos:', error));
         }
 
         function updateLogs() {
@@ -787,41 +1043,62 @@ HTML_TEMPLATE = '''
                 .then(response => response.json())
                 .then(data => {
                     const logsDiv = document.getElementById('logs');
-                    logsDiv.innerHTML = ''; // Limpiar logs anteriores
+                    const shouldScroll = logsDiv.scrollTop + logsDiv.clientHeight >= logsDiv.scrollHeight - 30;
+                    
+                    logsDiv.innerHTML = ''; 
                     data.forEach(log => {
                         const logEntry = document.createElement('div');
-                        if (log.message.includes('ERROR')) {
+                        if (log.message.toLowerCase().includes('error')) {
                             logEntry.className = 'log-entry error';
-                        } else if (log.message.includes('Nuevo dispositivo')) {
+                        } else if (log.message.includes('Nuevo dispositivo') || log.message.includes('reconectado')) {
                             logEntry.className = 'log-entry success';
-                        } else if (log.message.includes('Escaneo completado')) {
-                            logEntry.className = 'log-entry info';
+                        } else if (log.message.includes('desconectado') || log.message.includes('sudo')) {
+                             logEntry.className = 'log-entry warning';
                         } else {
                             logEntry.className = 'log-entry info';
                         }
                         logEntry.innerHTML = `<span class="log-timestamp">[${log.timestamp}]</span><span class="log-message">${log.message}</span>`;
                         logsDiv.appendChild(logEntry);
                     });
-                    logsDiv.scrollTop = logsDiv.scrollHeight; // Auto-scroll abajo
+                    
+                    if(shouldScroll) {
+                        logsDiv.scrollTop = logsDiv.scrollHeight; // Auto-scroll abajo
+                    }
                 })
                 .catch(error => console.error('Error al obtener logs:', error));
+        }
+        
+        function startDataRefreshLoop() {
+             if (!dataRefreshIntervalId) {
+                dataRefreshIntervalId = setInterval(() => {
+                    updateDevices();
+                    updateLogs();
+                }, 3000); // Intervalo de actualización de datos (3 seg)
+            }
+        }
+        
+        function stopDataRefreshLoop() {
+            if (dataRefreshIntervalId) {
+                clearInterval(dataRefreshIntervalId);
+                dataRefreshIntervalId = null;
+            }
         }
 
         function startScan() {
             const network = document.getElementById('network_range').value;
             const interval = document.getElementById('scan_interval').value;
+            const scanType = document.getElementById('scan_type').value;
+            
             fetch('/start_scan', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/x-www-form-urlencoded', },
-                body: `network_range=${encodeURIComponent(network)}&scan_interval=${encodeURIComponent(interval)}`
+                body: `network_range=${encodeURIComponent(network)}&scan_interval=${encodeURIComponent(interval)}&scan_type=${encodeURIComponent(scanType)}`
             })
             .then(response => response.json())
             .then(data => {
                 if(data.success) {
-                    updateStatus();
-                    if (!refreshIntervalId) {
-                        refreshIntervalId = setInterval(() => { updateDevices(); updateLogs(); }, 2000);
-                    }
+                    updateStatus(); 
+                    startDataRefreshLoop(); 
                 } else {
                     alert('Error: ' + data.message);
                 }
@@ -834,13 +1111,8 @@ HTML_TEMPLATE = '''
             .then(response => response.json())
             .then(data => {
                 if(data.success) {
-                    updateStatus();
-                    if (refreshIntervalId) {
-                        clearInterval(refreshIntervalId);
-                        refreshIntervalId = null;
-                    }
-                    // Limpiar contador cuando se detiene
-                    document.getElementById('deviceCount').textContent = '0';
+                    updateStatus(); 
+                    stopDataRefreshLoop(); 
                 } else {
                     alert('Error: ' + data.message);
                 }
@@ -848,15 +1120,20 @@ HTML_TEMPLATE = '''
             .catch(error => console.error('Error al detener escaneo:', error));
         }
 
+        // --- BUCLES DE ACTUALIZACIÓN PRINCIPALES ---
+        
         if (scanActive) {
-            refreshIntervalId = setInterval(() => { updateDevices(); updateLogs(); }, 2000);
+            startDataRefreshLoop();
         }
-        setInterval(updateStatus, 5000);
-        setInterval(updateLogs, 2000);
-
-        updateDevices();
-        updateLogs();
+        
+        setInterval(updateStatus, 3000); // El estado se chequea cada 3 seg
+        
+        // Carga inicial de datos
         updateStatus();
+        updateLogs();
+        if (scanActive) {
+            updateDevices(); 
+        }
     </script>
 </body>
 </html>
@@ -865,10 +1142,21 @@ HTML_TEMPLATE = '''
 # --- 7. Punto de Entrada ---
 if __name__ == '__main__':
     # Obtiene la IP local para sugerir la URL
-    local_ip, _ = get_local_network()
+    _, local_ip = get_local_network()
     print(f"\n--- Aplicación Web Iniciada ---")
-    print(f"Abre tu navegador y visita: http://127.0.0.1:5000")
+    
+    if os.name == 'nt':
+        print(f"\n*** IMPORTANTE (Windows): ***")
+        print(f"1. Asegúrate de que Nmap (nmap.exe) esté instalado y en tu PATH del sistema.")
+        print(f"2. Ejecuta este script como Administrador para detectar MACs.")
+    else:
+        print(f"\n*** IMPORTANTE (Linux/Mac): Para detectar MAC/Vendor, ejecuta este script con privilegios (ej. sudo python3 app.py) ***")
+
+    print(f"\nAbre tu navegador y visita: http://127.0.0.1:5000")
     print(f"O desde otro dispositivo de la red: http://{local_ip}:5000")
     print("Para detener la aplicación, presiona Ctrl+C aquí.")
     print("--------------------------------\n")
-    app.run(debug=True, host='0.0.0.0', port=5000) # host='0.0.0.0' permite acceso desde otros dispositivos en la red
+    
+    # debug=False es mejor para producción y evita hilos duplicados
+    app.run(debug=False, host='0.0.0.0', port=5000, threaded=True)
+
