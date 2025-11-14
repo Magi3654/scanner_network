@@ -8,6 +8,11 @@ import re
 import os
 import subprocess
 import xml.etree.ElementTree as ET
+import requests
+from requests.packages.urllib3.exceptions import InsecureRequestWarning
+
+# Suprimir warnings de SSL
+requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
 
 # --- 1. Definición de Clases ---
 
@@ -85,14 +90,12 @@ def get_local_mac():
         
         # Buscar la interfaz activa (excluyendo lo y docker)
         lines = result.stdout.split('\n')
-        current_interface = None
         
         for i, line in enumerate(lines):
             # Detectar línea de interfaz
             if re.match(r'^\d+:', line):
                 # Verificar si está UP y no es loopback ni docker
                 if 'state UP' in line and 'lo:' not in line and 'docker' not in line:
-                    current_interface = line
                     # La siguiente línea debería tener la MAC
                     if i + 1 < len(lines):
                         next_line = lines[i + 1]
@@ -104,7 +107,7 @@ def get_local_mac():
                                 return mac.upper()
                             except (ValueError, IndexError):
                                 pass
-    except Exception as e:
+    except Exception:
         pass
     
     # Método alternativo con ifconfig (sistemas más antiguos)
@@ -117,7 +120,6 @@ def get_local_mac():
         )
         
         # Buscar patrón de MAC
-        import re
         mac_pattern = r'([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})'
         matches = re.findall(mac_pattern, result.stdout)
         
@@ -137,30 +139,170 @@ def get_vendor_from_mac(mac):
     if not mac or mac == 'N/A':
         return 'N/A'
     
-    # Obtener los primeros 3 octetos (OUI)
+    # Obtener los primeros 3 octetos (OUI) - primeros 6 caracteres hex
     oui = mac.replace(':', '').replace('-', '').upper()[:6]
     
-    # Diccionario básico de fabricantes comunes (puedes expandirlo)
+    # Base de datos expandida de fabricantes comunes (OUI)
     vendors = {
+        # Intel
         'D4D853': 'Intel Corporate',
-        '00155D': 'Microsoft Corporation',
+        'F01898': 'Intel Corporate',
+        '0050F2': 'Microsoft (Intel)',
+        '6C2B59': 'Intel Corporate',
+        '3497F6': 'Intel Corporate',
+        '48F17F': 'Intel Corporate',
+        '7085C2': 'Intel Corporate',
+        
+        # Apple
         '001EC2': 'Apple, Inc.',
         '3C0754': 'Apple, Inc.',
         '68A86D': 'Apple, Inc.',
-        'F0189': 'Intel Corporate',
-        '0050F2': 'Microsoft',
         '001B63': 'Apple, Inc.',
-        '0024E8': 'Tp-Link Technologies',
-        '84C5A6': 'Tp-Link Technologies',
-        'C46E1F': 'Tp-Link Technologies',
+        '0050E4': 'Apple, Inc.',
+        '8C8590': 'Apple, Inc.',
+        'F0DCE2': 'Apple, Inc.',
+        'A43135': 'Apple, Inc.',
+        '9027E4': 'Apple, Inc.',
+        'B8E856': 'Apple, Inc.',
+        
+        # TP-Link
+        '0024E8': 'TP-Link Technologies',
+        '84C5A6': 'TP-Link Technologies',
+        'C46E1F': 'TP-Link Technologies',
+        'B0BE76': 'TP-Link Technologies',
+        'C83A35': 'TP-Link Technologies',
+        '1C3BF3': 'TP-Link Technologies',
+        'D8EB97': 'TP-Link Technologies',
+        
+        # Realtek
         '00E04C': 'Realtek Semiconductor',
-        '52540': 'Realtek Semiconductor',
-        'B0BE76': 'Tp-Link Technologies',
+        '525400': 'Realtek Semiconductor',
+        '0C5415': 'Realtek Semiconductor',
+        '18FE34': 'Realtek Semiconductor',
+        
+        # Microsoft
+        '00155D': 'Microsoft Corporation',
+        '00125A': 'Microsoft Corporation',
+        
+        # Hon Hai / Foxconn
         '30AEA4': 'Hon Hai Precision',
-        'C83A35': 'Tp-Link Technologies',
+        '00262D': 'Hon Hai Precision',
+        
+        # Samsung
+        '0C9D92': 'Samsung Electronics',
+        '84B541': 'Samsung Electronics',
+        'C4576E': 'Samsung Electronics',
+        
+        # Xiaomi
+        '34CE00': 'Xiaomi Communications',
+        '786A89': 'Xiaomi Communications',
+        
+        # Huawei
+        '7CE9D3': 'Huawei Technologies',
+        '0025BC': 'Huawei Technologies',
+        
+        # Cisco
+        '0011BB': 'Cisco Systems',
+        '001CB0': 'Cisco Systems',
+        
+        # D-Link
+        '001B11': 'D-Link Corporation',
+        '0018E7': 'D-Link Corporation',
+        
+        # Netgear
+        '002275': 'NETGEAR',
+        '001E2A': 'NETGEAR',
+        
+        # Asus
+        '1CB72C': 'ASUSTek Computer',
+        '2C56DC': 'ASUSTek Computer',
+        
+        # Belkin
+        '001150': 'Belkin International',
+        '0030BD': 'Belkin International',
     }
     
     return vendors.get(oui, 'Unknown Vendor')
+
+def get_http_title(ip, ports_list, timeout=3):
+    """
+    Intenta obtener el título de una página web HTTP/HTTPS.
+    
+    Args:
+        ip: Dirección IP del dispositivo
+        ports_list: Lista de puertos abiertos en formato ['80/http', '443/https']
+        timeout: Tiempo máximo de espera en segundos
+    
+    Returns:
+        str: Título de la página o 'N/A'
+    """
+    # Verificar si tiene puertos web abiertos
+    has_http = False
+    has_https = False
+    http_port = 80
+    https_port = 443
+    
+    for port_str in ports_list:
+        try:
+            port_num = int(port_str.split('/')[0])
+            service = port_str.split('/')[1].lower() if '/' in port_str else ''
+            
+            if port_num == 80 or 'http' in service:
+                has_http = True
+                http_port = port_num
+            elif port_num == 443 or 'https' in service or 'ssl' in service:
+                has_https = True
+                https_port = port_num
+        except (ValueError, IndexError):
+            continue
+    
+    if not has_http and not has_https:
+        return 'N/A'
+    
+    # Intentar primero HTTPS, luego HTTP
+    urls_to_try = []
+    if has_https:
+        urls_to_try.append(f"https://{ip}:{https_port}" if https_port != 443 else f"https://{ip}")
+    if has_http:
+        urls_to_try.append(f"http://{ip}:{http_port}" if http_port != 80 else f"http://{ip}")
+    
+    for url in urls_to_try:
+        try:
+            # Hacer petición HTTP con timeout corto
+            response = requests.get(
+                url,
+                timeout=timeout,
+                verify=False,  # Ignorar certificados SSL inválidos
+                allow_redirects=True,
+                headers={'User-Agent': 'NetworkScanner/1.0'}
+            )
+            
+            # Buscar el título en el HTML
+            html = response.text
+            title_match = re.search(r'<title[^>]*>(.*?)</title>', html, re.IGNORECASE | re.DOTALL)
+            
+            if title_match:
+                title = title_match.group(1).strip()
+                # Limpiar el título (eliminar saltos de línea, espacios extras)
+                title = re.sub(r'\s+', ' ', title)
+                # Truncar si es muy largo
+                if len(title) > 60:
+                    title = title[:57] + "..."
+                return title if title else 'N/A'
+            else:
+                # Si no hay título pero la petición fue exitosa
+                return f"HTTP {response.status_code}"
+                
+        except requests.exceptions.Timeout:
+            continue  # Intentar siguiente URL
+        except requests.exceptions.ConnectionError:
+            continue  # Intentar siguiente URL
+        except requests.exceptions.RequestException:
+            continue  # Intentar siguiente URL
+        except Exception:
+            continue  # Intentar siguiente URL
+    
+    return 'N/A'
 
 def scan_network(network_range, scan_type='quick'):
     """Escanea la red usando nmap directamente via subprocess."""
@@ -174,11 +316,11 @@ def scan_network(network_range, scan_type='quick'):
     if scan_type == 'detailed':
         nmap_cmd = [
             'nmap', '-sS', '-O', '--osscan-guess', '--host-timeout', '300s',
-            '-p', '21,22,23,25,53,80,110,135,139,143,443,445,993,995,1723,3306,3389,5900,8080',
+            '-p', '21,22,23,25,53,80,110,135,139,143,443,445,993,995,1723,3306,3389,5900,8080,8443',
             '-oX', '-',
             network_range
         ]
-        add_log("🔍 Modo DETALLADO: Escaneo SYN + 19 puertos + detección de SO...")
+        add_log("🔍 Modo DETALLADO: Escaneo SYN + puertos + SO + Títulos HTTP...")
     elif scan_type == 'deep':
         nmap_cmd = [
             'nmap', '-sS', '-sV', '-O', '--osscan-guess', '--host-timeout', '600s',
@@ -186,10 +328,10 @@ def scan_network(network_range, scan_type='quick'):
             '-oX', '-',
             network_range
         ]
-        add_log("🔬 Modo PROFUNDO: Escaneo SYN + top 100 puertos + versiones + SO...")
+        add_log("🔬 Modo PROFUNDO: Escaneo completo + versiones + SO + Títulos HTTP...")
     else:
         nmap_cmd = ['nmap', '-sn', '-oX', '-', network_range]
-        add_log("⚡ Modo RÁPIDO: Solo detección de hosts activos...")
+        add_log("⚡ Modo RÁPIDO: Solo detección de hosts activos (sin títulos HTTP)...")
     
     add_log(f"🔧 Comando: {' '.join(nmap_cmd)}")
     
@@ -245,6 +387,9 @@ def scan_network(network_range, scan_type='quick'):
             if mac_elem is not None:
                 mac = mac_elem.get('addr', 'N/A')
                 vendor = mac_elem.get('vendor', 'N/A')
+                # Convertir MAC a mayúsculas para consistencia
+                if mac != 'N/A':
+                    mac = mac.upper()
                 add_log(f"  🏷️  MAC: {mac} ({vendor})")
             else:
                 # Si es nuestra IP local y no hay MAC, obtenerla manualmente
@@ -267,50 +412,84 @@ def scan_network(network_range, scan_type='quick'):
                 hostname = get_hostname_from_ip(ip)
             add_log(f"  📛 Hostname: {hostname}")
             
-            # OS Detection - MEJORADO
+            # OS Detection - MEJORADO CON SELECCIÓN INTELIGENTE
             os_name = 'N/A'
             os_class = 'N/A'
             os_elem = host.find('os')
             
             if os_elem is not None:
-                # Intentar obtener el mejor match
+                # Intentar obtener TODOS los matches
                 osmatch_list = os_elem.findall('osmatch')
+                
                 if osmatch_list:
-                    # Ordenar por accuracy y tomar el mejor
-                    best_match = max(osmatch_list, key=lambda x: int(x.get('accuracy', '0')))
-                    os_name = best_match.get('name', 'N/A')
-                    accuracy = int(best_match.get('accuracy', '0'))
+                    # Filtrar y priorizar OS modernos
+                    modern_matches = []
+                    old_matches = []
                     
-                    if accuracy >= 70:
-                        # Truncar si es muy largo
+                    for match in osmatch_list:
+                        name = match.get('name', '')
+                        accuracy = int(match.get('accuracy', '0'))
+                        
+                        # Detectar si es un kernel antiguo
+                        if '2.6' in name or '3.X' in name or '4.X' in name.lower():
+                            old_matches.append((name, accuracy))
+                        else:
+                            modern_matches.append((name, accuracy))
+                    
+                    # Priorizar matches modernos con buena accuracy
+                    if modern_matches:
+                        # Ordenar por accuracy y tomar el mejor moderno
+                        modern_matches.sort(key=lambda x: x[1], reverse=True)
+                        os_name, accuracy = modern_matches[0]
+                    elif old_matches:
+                        # Si solo hay antiguos, tomar el mejor
+                        old_matches.sort(key=lambda x: x[1], reverse=True)
+                        os_name, accuracy = old_matches[0]
+                    else:
+                        # Fallback al mejor match original
+                        best_match = max(osmatch_list, key=lambda x: int(x.get('accuracy', '0')))
+                        os_name = best_match.get('name', 'N/A')
+                        accuracy = int(best_match.get('accuracy', '0'))
+                    
+                    # Formatear salida según accuracy
+                    if accuracy >= 85:
                         if len(os_name) > 60:
                             os_name = os_name[:57] + "..."
                         add_log(f"  💻 OS: {os_name} ({accuracy}% confianza)")
+                    elif accuracy >= 70:
+                        if len(os_name) > 50:
+                            os_name = os_name[:47] + "..."
+                        add_log(f"  💻 OS: {os_name} ({accuracy}% confianza)")
                     elif accuracy >= 50:
-                        os_name = f"{os_name[:40]}... ~{accuracy}%"
-                        add_log(f"  💻 OS (baja confianza): {os_name}")
+                        os_name = f"{os_name[:40]}..."
+                        add_log(f"  💻 OS (moderada confianza): {os_name} ~{accuracy}%")
                     else:
-                        add_log(f"  ⚠️  OS detectado pero confianza muy baja ({accuracy}%)")
-                        os_name = 'N/A'
+                        add_log(f"  ⚠️  OS detectado pero baja confianza ({accuracy}%)")
+                        # Si la confianza es muy baja, mejor mostrar el rango
+                        if len(osmatch_list) > 1:
+                            os_name = f"Linux 5.X-6.X (estimado)"
+                        else:
+                            os_name = 'N/A'
                 
                 # Obtener tipo de dispositivo
                 osclass_list = os_elem.findall('osclass')
                 if osclass_list:
-                    # Tomar el primer osclass con mayor accuracy
+                    # Tomar el osclass con mayor accuracy
                     best_class = max(osclass_list, key=lambda x: int(x.get('accuracy', '0')))
                     os_class = best_class.get('type', 'N/A')
+                    
+                    # Fallback a osfamily si type no está disponible
                     if os_class == 'N/A':
                         os_class = best_class.get('osfamily', 'N/A')
                     
                     if os_class != 'N/A':
                         add_log(f"  🔖 Tipo: {os_class}")
-            
-            # Si no hay OS detection, intentar con OS fingerprinting verbose
-            if os_name == 'N/A' and os_elem is not None:
-                # Buscar en portused para inferencias
-                portused = os_elem.findall('portused')
-                if portused:
-                    add_log(f"  🔬 OS fingerprinting encontró {len(portused)} puertos usados")
+                
+                # Si no hay tipo, intentar inferir desde el OS name
+                if os_class == 'N/A' and os_name != 'N/A':
+                    if 'linux' in os_name.lower():
+                        os_class = 'Linux'
+                        add_log(f"  🔖 Tipo inferido: {os_class}")
             
             # Puertos
             ports_list = []
@@ -384,7 +563,7 @@ def scan_network(network_range, scan_type='quick'):
                     except:
                         pass
                 
-                if 80 in port_numbers or 443 in port_numbers:
+                if 80 in port_numbers or 443 in port_numbers or 8080 in port_numbers or 8443 in port_numbers:
                     os_class = 'Web Server'
                     add_log(f"  🔍 Tipo inferido: {os_class}")
                 elif 22 in port_numbers:
@@ -396,6 +575,19 @@ def scan_network(network_range, scan_type='quick'):
                 elif 445 in port_numbers or 139 in port_numbers:
                     os_class = 'Windows/Samba'
                     add_log(f"  🔍 Tipo inferido: {os_class}")
+                elif 3306 in port_numbers:
+                    os_class = 'MySQL Server'
+                    add_log(f"  🔍 Tipo inferido: {os_class}")
+            
+            # Obtener título HTTP (solo si hay puertos web y no es modo rápido)
+            http_title = 'N/A'
+            if scan_type != 'quick' and len(ports_list) > 0:
+                add_log(f"  🌐 Intentando obtener título HTTP...")
+                http_title = get_http_title(ip, ports_list, timeout=3)
+                if http_title != 'N/A':
+                    add_log(f"  ✅ Título HTTP: {http_title}")
+                else:
+                    add_log(f"  ⚠️  No se pudo obtener título HTTP")
             
             devices_dict[ip] = {
                 'ip': ip,
@@ -404,7 +596,7 @@ def scan_network(network_range, scan_type='quick'):
                 'vendor': vendor,
                 'os': os_name,
                 'os_class': os_class,
-                'http_title': 'N/A',
+                'http_title': http_title,
                 'ports': ports_list
             }
             
@@ -981,10 +1173,11 @@ th {
   display: none;
 }
 
-/* MODO DETALLADO - Mostrar OS, Tipo y Puertos */
+/* MODO DETALLADO - Mostrar OS, Tipo, Puertos y Título HTTP */
 body[data-scan-type="detailed"] .col-os,
 body[data-scan-type="detailed"] .col-type,
-body[data-scan-type="detailed"] .col-ports {
+body[data-scan-type="detailed"] .col-ports,
+body[data-scan-type="detailed"] .col-http {
   display: table-cell;
 }
 
@@ -1259,7 +1452,7 @@ tbody tr:last-child td {
     <div class="container">
         <header>
             <h1>🌐 Escáner de Red</h1>
-            <p>Monitor de dispositivos con detección automática de MAC local</p>
+            <p>Monitor completo con detección de MAC, SO y Títulos HTTP</p>
         </header>
 
         <div class="status-bar">
@@ -1290,12 +1483,10 @@ tbody tr:last-child td {
                 
                 <div class="info-box">
                     <strong>💡 Modos de Escaneo</strong>
-                    <strong>⚡ Rápido:</strong> Solo IPs, MACs y Hostnames<br>
-                    <strong>🔍 Detallado:</strong> + Puertos + Sistema Operativo<br>
-                    <strong>🔬 Profundo:</strong> + Versiones de servicios<br>
+                    <strong>⚡ Rápido:</strong> IPs, MACs, Hostnames<br>
+                    <strong>🔍 Detallado:</strong> + Puertos + SO + Títulos HTTP<br>
+                    <strong>🔬 Profundo:</strong> + Versiones de servicios + Títulos HTTP<br>
                     <br>
-                    <strong>⚠️ CRÍTICO - Ejecutar con:</strong><br>
-                    <code>sudo venv/bin/python3 app_web_escaneo.py</code>
                 </div>
                 
                 <div class="form-group">
@@ -1305,9 +1496,9 @@ tbody tr:last-child td {
                 <div class="form-group">
                     <label for="scan_type">Tipo de Escaneo</label>
                     <select id="scan_type">
-                        <option value="quick">⚡ Rápido (10-20s)</option>
-                        <option value="detailed">🔍 Detallado (2-5min)</option>
-                        <option value="deep">🔬 Profundo (5-15min)</option>
+                        <option value="quick">⚡ Rápido </option>
+                        <option value="detailed">🔍 Detallado </option>
+                        <option value="deep">🔬 Profundo </option>
                     </select>
                 </div>
                 <div class="form-group">
@@ -1421,8 +1612,7 @@ tbody tr:last-child td {
                     let activeCount = 0;
                     
                     if (data.length === 0) {
-                        const colspan = currentScanType === 'quick' ? '6' : 
-                                       currentScanType === 'detailed' ? '9' : '10';
+                        const colspan = currentScanType === 'quick' ? '6' : '10';
                         tbody.innerHTML = `
                             <tr>
                                 <td colspan="${colspan}" style="text-align: center; padding: 2rem; color: var(--color-text-tertiary);">
@@ -1566,28 +1756,34 @@ if __name__ == '__main__':
     local_mac = get_local_mac()
     
     print(f"\n{'='*60}")
-    print(f"  🌐 ESCÁNER DE RED CON DETECCIÓN DE MAC LOCAL")
+    print(f"  🌐 ESCÁNER DE RED - VERSIÓN CON TÍTULOS HTTP")
     print(f"{'='*60}")
     
     if os.name != 'nt':
         print(f"\n⚠️  CRÍTICO - EJECUTA CON SUDO:")
         print(f"   sudo venv/bin/python3 app_web_escaneo.py")
-        print(f"\n   Sin sudo, el escaneo SYN (-sS) y OS detection (-O)")
-        print(f"   NO funcionarán correctamente")
+        print(f"\n   Sin sudo: escaneo SYN (-sS) y OS detection (-O) NO funcionarán")
     
     print(f"\n📡 Información del sistema:")
     print(f"   IP Local:  {local_ip}")
     if local_mac:
         print(f"   MAC Local: {local_mac}")
+        print(f"   Vendor:    {get_vendor_from_mac(local_mac)}")
     else:
-        print(f"   MAC Local: No detectada (esto es raro)")
+        print(f"   MAC Local: ⚠️  No detectada")
     
     print(f"\n📡 URLs de acceso:")
     print(f"   Local:  http://127.0.0.1:5000")
     print(f"   Red:    http://{local_ip}:5000")
-    print(f"\n💡 Tu MAC local será detectada automáticamente")
-    print(f"💡 Otros dispositivos mostrarán su MAC via nmap")
-    print(f"💡 Presiona Ctrl+C para detener")
+    print(f"\n💡 Funcionalidades implementadas:")
+    print(f"   ✅ Detección automática de MAC local")
+    print(f"   ✅ Base de datos expandida de fabricantes")
+    print(f"   ✅ Selección inteligente de SO (prioriza versiones modernas)")
+    print(f"   ✅ Inferencia de tipo de dispositivo mejorada")
+    print(f"   ✅ NUEVO: Extracción de títulos HTTP/HTTPS")
+    print(f"   ✅ NUEVO: Timeout de 3s para páginas web")
+    print(f"   ✅ NUEVO: Soporte para certificados SSL autofirmados")
+    print(f"\n💡 Presiona Ctrl+C para detener")
     print(f"{'='*60}\n")
     
     app.run(debug=False, host='0.0.0.0', port=5000, threaded=True)
